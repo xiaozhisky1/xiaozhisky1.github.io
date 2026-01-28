@@ -19,7 +19,7 @@
 # in the templates via {{ site.myvariable }}.
 
 title: Linzhi Wu's Blog
-email: 24210860078@m.fudan.edu.cn
+email: lzwu24@m.fudan.edu.cn
 baseurl: "" # the subpath of your site, e.g. /blog
 url: "" # the base hostname & protocol for your site, e.g. http://example.com
 github_username:  xiaozhisky1
