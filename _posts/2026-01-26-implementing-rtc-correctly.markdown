@@ -195,7 +195,7 @@ Please feel free to cite this work as
   author = { {{ page.author }} },
   title  = { {{ page.title }} },
   year   = { {{ page.date | date: "%Y" }} },
-  url    = { {{ page.url | absolute_url }} },
+  url    = { https://xiaozhisky1.github.io/jekyll/update/2026/01/26/implementing-rtc-correctly.html },
   note   = { Blog post }
 }
 ```
