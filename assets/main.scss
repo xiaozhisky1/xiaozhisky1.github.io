@@ -1,0 +1,22 @@
+---
+---
+
+@import "minima";
+
+
+.home .post-link {
+  font-weight: 650;
+}
+
+.post-subtitle {
+  display: inline-block;
+  font-size: 0.85em;
+  font-weight: 400;
+  line-height: 1.2;
+}
+
+.post-list-subtitle {
+  margin: 0.15rem 0 0;
+  font-size: 1em;
+  color: $text-color;
+}
