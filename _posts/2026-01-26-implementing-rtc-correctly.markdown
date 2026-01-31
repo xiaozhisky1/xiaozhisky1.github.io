@@ -1,7 +1,7 @@
 ---
 layout: post
-title: "Implementing RTC Correctly"
-subtitle: "A Subtle Gradient-Propagation Bug and Its Fix"
+title: "A Practical RTC-Style Stitching Workaround"
+subtitle: "Stop-Gradient Guidance for Cross-Chunk Continuity"
 date:   2026-01-26 11:41:56 +0800
 categories: jekyll update
 math: true
@@ -14,7 +14,9 @@ citekey: "wu2026rtc"
 
 Recent vision-language-action (VLA) models have shown impressive capability in robotic manipulation, but their high inference latency remains a major obstacle for real-time deployment. The Real-Time Chunking (RTC) framework addresses this issue by enabling asynchronous execution of action-chunked policies, reformulating real-time control as an inference-time inpainting problem. Without any retraining, RTC allows a policy to generate future action chunks while safely executing previously committed actions, achieving smooth and delay-robust behavior in both simulation and real-world robotic tasks.
 
-While reproducing the results of this work and experimenting with its released implementation, I ran into an easy-to-make implementation pitfall that can meaningfully affect cross-chunk continuity and runtime behavior. Specifically, when implementing RTC’s per-step correction for stitching chunks, it is tempting to let gradients propagate through the learned vector field / flow policy $$v(\cdot)$$ via automatic differentiation. However, the intended update is to adjust the current latent/state to enforce consistency, rather than to differentiate through $$v$$ itself. In practice, allowing $$\nabla v$$ to participate changes the effective update rule, which can introduce discrepancies between the method described in the paper and its practical execution. In this post, I briefly summarize the key mechanism behind RTC and then focus on this gradient-handling pitfall, explaining its impact and a simple correction (stopping gradients through $$v$$) that better matches the intended algorithm.
+While reproducing the results of this work and experimenting with its released implementation, I ran into a gradient-handling pitfall that can meaningfully affect cross-chunk continuity and runtime behavior. Specifically, when implementing RTC-style per-step “stitching” guidance, it is tempting to let gradients propagate through the learned vector field / flow policy $$v(\cdot)$$ via automatic differentiation.
+
+In retrospect, the approach described in this post is best viewed as a **pragmatic workaround**: it often produces an RTC-like continuity effect, but it is not necessarily a principled or faithful implementation of RTC in a strict algorithmic sense. The goal here is to document an implementation choice—stopping gradients through $$v$$—that can strengthen the guidance signal in practice, and to show what changes when you do (or do not) take that shortcut.
 
 ## Preliminaries
 
@@ -51,7 +53,7 @@ A naive asynchronous strategy can be real-time when $$d \le H - s$$, but it may 
 RTC frames asynchronous chunking as an **inpainting** problem: while executing the previous chunk, the actions that are guaranteed to be executed due to delay are treated as “frozen,” and the rest of the new chunk is generated to be compatible with the previous one.  
 To strengthen cross-chunk continuity, RTC uses **soft masking** weights $$W$$: the first $$d$$ overlapping actions receive weight 1, the non-overlapping tail receives weight 0, and the intermediate region decays smoothly from 1 to 0. The guided inference step is implemented via a vector–Jacobian product (VJP) computed with reverse-mode autodifferentiation, which is exactly where gradient-handling becomes subtle in practice. 
 
-## The ΠGDM Correction Term and Differentiating with $$v$$ Treated as Constant
+## The ΠGDM Correction Term and a Stop-Gradient Approximation
 
 In RTC, the ΠGDM-style corrected vector field can be written as
 
@@ -65,7 +67,7 @@ v(A_t^\tau,o_t,\tau)
 \frac{1-\tau}{\tau \cdot r_\tau^{2}}
 \right)
 \bigl(Y - \hat{A}_t^{1}\bigr)^\top \mathrm{diag}(W)\;
-\frac{\partial A_t^{1}}{\partial A_t^\tau},
+\frac{\partial \hat{A}_t^{1}}{\partial A_t^\tau},
 \tag{3}
 $$
 
@@ -87,7 +89,7 @@ $$
 
 At first glance, it seems natural to use (5) when computing the VJP in (3).
 
-However, in RTC’s runtime stitching (the inpainting/continuity view), it is often more appropriate to **treat $$v$$ as constant** (i.e., stop gradients through $$v$$) so that
+However, if your goal is a “residual-style” stitching constraint (the inpainting/continuity view), a common practical approximation is to **treat $$v$$ as constant** for the VJP (i.e., stop gradients through $$v$$). Under this approximation,
 
 $$
 \frac{\partial \hat{A}_t^{1}}{\partial A_t^\tau} = I,
@@ -105,13 +107,11 @@ $$
 \tag{7}
 $$
 
-### Why treat $$v$$ as constant in RTC?
+### Why stop gradients through $$v$$ in practice?
 
-The key point is that this guidance step is meant to enforce **cross-chunk continuity**—conceptually an inpainting constraint that pulls the current prediction $$A_t^{c1}$$ toward the target $$Y$$ in the overlap region (weighted by $$W$$). The guidance should update the sample/state $$A_t^\tau$$ to satisfy the constraint. In practice, an incorrect gradient path can **dampen the effective guidance signal**, making the resulting correction term too small to meaningfully steer the trajectory at chunk boundaries. When the guidance is underpowered, the sampler largely follows the unconditional flow, and cross-chunk continuity degrades because the constraint is not enforced strongly enough.
+The key point is that this guidance step is trying to enforce **cross-chunk continuity**—conceptually an inpainting constraint that pulls the current prediction toward a target $$Y$$ in the overlap region (weighted by $$W$$). In practice, letting gradients flow “through the network” can sometimes **dampen the effective guidance signal**, making the resulting correction term too small to meaningfully steer the trajectory at chunk boundaries. When the guidance is underpowered, the sampler largely follows the unconditional flow, and cross-chunk continuity can degrade because the constraint is not enforced strongly enough.
 
-From an implementation perspective, $$v(A_t^\tau,o_t,\tau)$$ is produced by a neural network and is implicitly a function of the current state $$A_t^\tau$$. If one differentiates through this dependency, the guidance term is no longer a direct residual-based correction; instead, it becomes entangled with how the network output changes with its input. In RTC’s setting, the intended behavior is to treat $$v(A_t^\tau,o_t,\tau)$$ as a fixed function evaluation at the current step and use it only to construct the update for $$A_t^\tau$$, rather than propagating gradients through $$v$$ itself.
-
-Here is code that is definitely correct for 1→0 flow integration (e.g., \\(\pi_{0}\\)). In `def denoiser()`, we apply `jax.lax.stop_gradient(v_t)` to ensure that `jax.vjp` does not backpropagate through the gradient of `v_t`.
+Here is a minimal JAX sketch of the stop-gradient workaround for 1→0 flow integration (e.g., \\(\pi_{0}\\)). In `denoiser()`, we apply `jax.lax.stop_gradient(v_t)` so that `jax.vjp` does not backpropagate through `v_t_fn` (i.e., treats `v_t` as constant w.r.t. `x_t`).
 
 ```python
 import jax
@@ -150,19 +150,16 @@ def pinv_corrected_velocity(
     return _pinv_corrected_velocity(x_t, prefix_actions)
 ```
 
-## Experiment: What does correctly implemented RTC look like in practice?
+## Experiment: What does this RTC-like workaround look like in practice?
 
-We fine-tuned \\(\pi_{05}\\) on a dual-arm Flexiv robot to perform a LEGO sorting task. The figure below shows RTC results evaluated on dataset trajectories. 
+We fine-tuned \\(\pi_{05}\\) on a dual-arm Flexiv robot to perform a LEGO sorting task. The figure below shows results from this RTC-style stitching guidance (using the stop-gradient workaround), evaluated on dataset trajectories.
 
-- <span style="color: purple;">purple</span> denotes the actions generated by RTC,
-
+- <span style="color: purple;">purple</span> denotes the actions generated with the RTC-style stitching guidance (stop-gradient workaround),
 - <span style="color: green;">green</span> denotes the corresponding actions from the previous action chunk used for guidance, 
-
-- <span style="color: red;">red dashed</span> denotes the actions generated without RTC, 
-
+- <span style="color: red;">red dashed</span> denotes the actions generated without this stitching guidance, 
 - <span style="color: gray;">gray dashed</span> denotes the inference delay.
 
-We use an action chunk length of 100. The RTC-related parameters in this test are: `inference_delay = 16`, `max_guidance_weight = 10`, and `execution_horizon = 64`.
+We use an action chunk length of 100. The RTC-related parameters in this test are: `inference_delay = 16`, `max_guidance_weight = 10`, and `execution_horizon = 64`. 
 
 Notably, the y-axis is measured in meters. The 14 dimensions in the plot correspond to \\((x, y, z, r_x, r_y, r_z, \\text{gripper}) \\times 2\\)
 
@@ -182,17 +179,22 @@ In addition, tuning `max_guidance_weight` suggests that `max_guidance_weight = 1
 
 ![]({{ "/img/correction,max_guidance_weight=100.png" | relative_url }})
 
+### Unmodified RTC max_guidance = 5
+![]({{ "/img/original,max_guidance=5.png" | relative_url }})
+
+### Unmodified RTC max_guidance = 100
+![]({{ "/img/original,max_guidance=100.png" | relative_url }})
+
 > ⚠️ **Important note / Limitations.**  
-> These experiments were conducted under fairly limited conditions—only a small number of tasks and just a handful of episodes—though we tested multiple action parameterizations, including absolute end-effector poses, relative end-effector poses, relative joint angles, and absolute joint angles. Despite these limitations, we still believe the observations reported here are likely to generalize to other settings.
+> These experiments were conducted under fairly limited conditions—only a small number of tasks and just a handful of episodes—though we tested multiple action parameterizations, including absolute end-effector poses, relative end-effector poses, relative joint angles, and absolute joint angles. This method may encounter issues in certain scenarios, and it is only provided as a reference.
 
 ## Citation
 
 Please feel free to cite this work as
 
-
 ```bibtex
 @misc{ {{ page.citekey }},
-  author = { {{ page.author }} },
+  author = { {{ page.author | replace: ",", " and" }} },
   title  = { {{ page.title }} },
   year   = { {{ page.date | date: "%Y" }} },
   url    = { https://xiaozhisky1.github.io/jekyll/update/2026/01/26/implementing-rtc-correctly.html },
